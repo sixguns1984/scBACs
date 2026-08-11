@@ -1,0 +1,664 @@
+# scBACs — Single-cell Brain Age Clocks
+
+[![Python](https://img.shields.io/badge/python-3.9--3.11-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-green)]()
+[![Status](https://img.shields.io/badge/status-active-success)]()
+
+**scBACs** is a Python package for training cell-type-specific transcriptomic age clocks, applying the released human brain scBAC models, and quantifying **relative age acceleration (RAA)** and **age at aging acceleration onset (AASO)** from single-cell or single-nucleus RNA-seq data.
+
+The current scBAC framework ensembles three complementary models:
+
+- Elastic Net regression
+- Neural Cumulative Link Model (CLM)
+- Transformer regression
+
+The primary released clock is stage-specific: **Development (`age <= 18`)** and **Adult (`age > 18`)** models are trained separately and routed by chronological age. A Full-lifespan model is also available as a comparison model.
+
+## Key features
+
+- Train a new scBAC-style clock on your own annotated AnnData dataset.
+- Predict new cells with your own trained model bundle.
+- Apply the authors' fixed pretrained brain-cell clocks.
+- Automatic download/extraction of released model files from Zenodo.
+- Donor-grouped cross-validation for custom training.
+- Cell-level RAA reference fitting or use of a released fixed RAA reference.
+- Cell-type-specific Q5/Q25/Q50/Q75/Q95 RAA thresholds.
+- Donor-level AASO estimation using the same first-crossing framework used in the study.
+- Python/IDE API and command-line interface.
+- CPU and CUDA inference/training support.
+
+## Installation
+
+```bash
+pip install scbac
+```
+
+The pretrained model archive is hosted on Zenodo:
+
+```text
+https://zenodo.org/records/21882804/files/scBrainAgeClock_models_file.zip?download=1
+```
+
+scBAC performs a best-effort model download during source/classic installation. Because modern `pip` commonly installs a prebuilt wheel and wheel installation does not provide a reliable post-install hook, **the package also automatically downloads and extracts the model archive the first time the released pretrained clock is used**. No separate manual step is required for normal pretrained prediction.
+
+You can explicitly install or inspect the model files with:
+
+```bash
+scbac models install
+scbac models status
+```
+
+Legacy command:
+
+```bash
+scbac-install-models
+```
+
+By default the archive is installed under:
+
+```text
+~/.scbac/models/scBrainAgeClock_models_file/
+```
+
+Override this with `SCBAC_MODEL_DIR` or `--model-dir`.
+
+## Released pretrained cell types
+
+The released scBAC models require the following **exact cell-type labels**:
+
+| Cell type | Required label |
+|---|---|
+| Excitatory neurons | `Exc` |
+| Inhibitory neurons | `Inh` |
+| Astrocytes | `Ast` |
+| Oligodendrocytes | `Oli` |
+| Oligodendrocyte progenitor cells | `OPC` |
+| Microglia | `Mic` |
+| Endothelial cells | `End` |
+| Fibroblasts | `Fib` |
+| Pericytes | `Per` |
+| CNS-associated macrophages | `CAM` |
+| T cells | `T_cell` |
+
+For the **released pretrained models**, aliases such as `Astrocyte`, `Tcell`, `Microglia`, etc. are not silently remapped. This is intentional: users should supply a cell-type column using the canonical labels above.
+
+Custom clocks trained with scBAC may use any user-defined cell-type labels.
+
+---
+
+# 1. Predict cellular age with the released scBAC models
+
+## CLI
+
+```bash
+scbac predict \
+    --source pretrained \
+    --input input.h5ad \
+    --output predicted.h5ad \
+    --cell-type-column my_celltype \
+    --chronological-age-col donor_age \
+    --count-layer counts \
+    --stage auto \
+    --device cpu
+```
+
+`--stage auto` routes cells with age `<=18` to the Development ensemble and cells with age `>18` to the Adult ensemble. Therefore the chronological-age column is required for automatic stage routing.
+
+To apply one fixed stage explicitly:
+
+```bash
+scbac predict \
+    --source pretrained \
+    --input input.h5ad \
+    --output predicted.csv \
+    --cell-type-column celltype \
+    --stage adult \
+    --device cuda
+```
+
+Available stages are `auto`, `development`, `adult`, `full`, and `all`.
+
+Add the published benchmarking clock where available:
+
+```bash
+scbac predict ... --benchmarking
+```
+
+## Python / IDE
+
+```python
+import scanpy as sc
+from scbac import PretrainedClock
+
+adata = sc.read_h5ad("input.h5ad")
+
+clock = PretrainedClock(device="cuda")  # downloads models automatically if absent
+pred = clock.predict(
+    adata,
+    celltype_col="my_celltype",
+    age_col="donor_age",
+    count_layer="counts",
+    stage="auto",
+    include_benchmarking=True,
+)
+
+print(pred[["scBAC_age", "scBAC_stage"]].head())
+```
+
+For each component model, the released five fold-specific predictions are averaged first; `scBAC_age` is then the mean prediction across Elastic Net, CLM and Transformer.
+
+Each independent input dataset is normalized independently using Scanpy library-size normalization followed by `log1p`. Expression is aligned to the exact ordered training feature list, and absent model genes are assigned zero after alignment.
+
+---
+
+# 2. Train your own age clock
+
+scBAC can train the current model framework on a user-supplied annotated AnnData object.
+
+You must specify which `obs` columns correspond to:
+
+- cell type
+- donor/sample ID
+- chronological age
+
+The dataset/status columns are optional. If no status column is provided, all cells are treated as eligible training data. If a status column is provided, `--control-label` identifies which samples are used to construct the normal-aging clock.
+
+## CLI
+
+```bash
+scbac train \
+    --input training.h5ad \
+    --output-dir my_clock \
+    --model-name MyBrainClock \
+    --cell-type-column annotation \
+    --donor-col participant \
+    --age-col age_years \
+    --dataset-col cohort \
+    --status-col diagnosis \
+    --control-label CT \
+    --count-layer counts \
+    --celltypes Exc,Inh,Ast \
+    --stages development,adult,full \
+    --algorithms elasticnet,clm,transformer \
+    --device cuda
+```
+
+The default training framework uses donor-disjoint five-fold cross-validation.
+
+## Python / IDE
+
+```python
+import scanpy as sc
+from scbac import train_clock
+
+adata = sc.read_h5ad("training.h5ad")
+
+manifest = train_clock(
+    adata,
+    "my_clock",
+    model_name="MyBrainClock",
+    celltype_col="annotation",
+    donor_col="participant",
+    age_col="age_years",
+    dataset_col="cohort",
+    status_col="diagnosis",
+    control_label="CT",
+    count_layer="counts",
+    celltypes=["Exc", "Inh", "Ast"],
+    stages=["development", "adult"],
+    algorithms=["elasticnet", "clm", "transformer"],
+    device="cuda",
+)
+```
+
+## Custom model bundle format
+
+Unlike the historical released model filenames, all newly trained user models use one consistent package-native layout:
+
+```text
+my_clock/
+├── manifest.json
+└── celltypes/
+    ├── Exc/
+    │   ├── development/
+    │   │   ├── elasticnet/
+    │   │   │   ├── metadata.json
+    │   │   │   ├── features.csv
+    │   │   │   ├── fold_1.joblib
+    │   │   │   └── ...
+    │   │   ├── clm/
+    │   │   │   ├── metadata.json
+    │   │   │   ├── features.csv
+    │   │   │   ├── fold_1.pt
+    │   │   │   └── ...
+    │   │   └── transformer/
+    │   │       ├── metadata.json
+    │   │       ├── features.csv
+    │   │       ├── fold_1.pt
+    │   │       └── ...
+    │   └── adult/
+    │       └── ...
+    └── Inh/
+        └── ...
+```
+
+The bundle manifest records the training cell types, stages, algorithms, age cutoff, fold count, metadata-column semantics and normalization procedure.
+
+### Current training algorithms
+
+**Elastic Net**
+
+- alpha = 0.01
+- candidate L1 ratios = 0.10, 0.50, 0.70, 0.90, 0.95
+- donor-grouped 5-fold cross-validation
+- no preliminary age-correlation feature selection
+
+**Neural Cumulative Link Model (CLM)**
+
+- Development: 2-year ordered age intervals
+- Adult/Full: 5-year intervals
+- hidden layers: 128 and 64
+- GroupNorm, ReLU, dropout 0.5
+- ordinal NLL + MAE + rank loss
+- inner donor validation for epoch selection
+
+**Transformer**
+
+- ordered genes divided into 20 consecutive tokens
+- 128-dimensional token embedding
+- 1 encoder layer, 4 attention heads
+- 256-dimensional feed-forward layer
+- GELU, dropout 0.5, global average pooling
+- MSE + AdamW
+- early stopping and gradient clipping
+
+---
+
+# 3. Predict new data with your own trained clock
+
+## CLI
+
+```bash
+scbac predict \
+    --source custom \
+    --custom-model my_clock \
+    --input new_data.h5ad \
+    --output custom_predictions.h5ad \
+    --cell-type-column annotation \
+    --chronological-age-col age_years \
+    --count-layer counts \
+    --stage auto \
+    --device cuda
+```
+
+## Python / IDE
+
+```python
+import scanpy as sc
+from scbac import CustomClock
+
+adata = sc.read_h5ad("new_data.h5ad")
+clock = CustomClock("my_clock", device="cuda")
+
+pred = clock.predict(
+    adata,
+    celltype_col="annotation",
+    age_col="age_years",
+    count_layer="counts",
+    stage="auto",
+)
+```
+
+---
+
+# 4. Relative age acceleration (RAA)
+
+RAA is calculated relative to a cell-type-specific normal-aging reference. The package-native linear reference is fitted in controls as:
+
+```text
+predicted cellular age ~ chronological age + sex + donor cell count
+```
+
+Sex is encoded as Female = 0 and Male = 1.
+
+## Fit your own RAA reference
+
+```bash
+scbac raa-fit \
+    --input control_predictions.csv \
+    --output-dir my_raa_reference \
+    --donor-col participant \
+    --celltype-col celltype \
+    --predicted-age-col scBAC_age \
+    --age-col age_years \
+    --sex-col sex
+```
+
+If the table includes multiple groups:
+
+```bash
+scbac raa-fit \
+    --input predictions.csv \
+    --output-dir my_raa_reference \
+    --donor-col participant \
+    --celltype-col celltype \
+    --predicted-age-col scBAC_age \
+    --age-col age_years \
+    --sex-col sex \
+    --group-col diagnosis \
+    --control-groups CT
+```
+
+This creates:
+
+```text
+my_raa_reference/
+├── raa_model.pkl
+└── thresholds.json
+```
+
+`thresholds.json` contains cell-type-specific Q5, Q25, Q50, Q75 and Q95 control RAA thresholds.
+
+## Apply a saved RAA reference
+
+```bash
+scbac raa \
+    --input predictions.csv \
+    --output predictions_with_RAA.csv \
+    --reference my_raa_reference \
+    --donor-col participant \
+    --celltype-col celltype \
+    --predicted-age-col scBAC_age \
+    --age-col age_years \
+    --sex-col sex
+```
+
+Python:
+
+```python
+from scbac import fit_raa_reference, apply_raa
+
+control_raa, models, thresholds = fit_raa_reference(
+    controls,
+    "my_raa_reference",
+    donor_col="participant",
+    celltype_col="celltype",
+    predicted_age_col="scBAC_age",
+    chronological_age_col="age_years",
+    sex_col="sex",
+)
+
+all_cells_with_raa, thresholds = apply_raa(
+    all_cells,
+    reference="my_raa_reference",
+    donor_col="participant",
+    celltype_col="celltype",
+    predicted_age_col="scBAC_age",
+    chronological_age_col="age_years",
+    sex_col="sex",
+)
+```
+
+## Author-provided RAA reference files
+
+The source package contains a dedicated location for the study's fixed RAA models and thresholds:
+
+```text
+src/scbac/pretrained_raa/
+└── Ensemble_Adult/
+    ├── adult_linear_celllevel.pkl
+    └── thresholds_*.json
+```
+
+The package supports both the manuscript-era filenames above and the package-native names `raa_model.pkl` + `thresholds.json`.
+
+At runtime, an external RAA directory can also be specified with:
+
+```bash
+export SCBAC_RAA_DIR=/path/to/RAA_models
+```
+
+or directly through `reference=...` / `--reference`.
+
+---
+
+# 5. Age at aging acceleration onset (AASO)
+
+AASO is defined for each donor and cell type as the predicted cellular age at which the donor-specific smoothed RAA trajectory first crosses the corresponding accelerated-aging threshold from below.
+
+The default threshold is **Q75** of the control RAA distribution.
+
+```bash
+scbac aaso \
+    --input predictions_with_RAA.csv \
+    --output AASO.csv \
+    --reference my_raa_reference \
+    --donor-col participant \
+    --celltype-col celltype \
+    --predicted-age-col scBAC_age \
+    --raa-col RAA \
+    --quantile q75
+```
+
+Python:
+
+```python
+from scbac import calculate_aaso, load_thresholds
+
+thresholds = load_thresholds(reference="my_raa_reference")
+aaso, curves = calculate_aaso(
+    cells_with_raa,
+    thresholds,
+    donor_col="participant",
+    celltype_col="celltype",
+    predicted_age_col="scBAC_age",
+    raa_col="RAA",
+    quantile="q75",
+)
+```
+
+The implementation uses the study's donor-curve procedure: RAA outlier filtering, a 100-point predicted-age grid, a ±2-year moving window, linear interpolation, and the first threshold crossing from below. Donor-cell-type combinations with fewer than 10 cells are excluded by default; left-censored trajectories are not assigned a numeric AASO unless explicitly requested.
+
+---
+
+# 6. End-to-end RAA + AASO analysis
+
+The old-style high-level workflow remains available:
+
+```bash
+scbac analyze \
+    --input predicted_cells.csv \
+    --output-prefix results/scbac_analysis \
+    --reference my_raa_reference \
+    --donor-col participant \
+    --celltype-col celltype \
+    --predicted-age-col scBAC_age \
+    --age-col age_years \
+    --sex-col sex \
+    --metadata-cols status,dataset \
+    --status-col status \
+    --disease-name AD \
+    --control-name CT
+```
+
+This writes cell-level RAA, donor-level AASO, cell-type summaries, pairwise Welch tests with FDR correction, optional disease-versus-control AASO statistics, an AASO boxplot and example RAA/AASO curves.
+
+You can also provide `--control-input` instead of `--reference` to fit a new RAA reference as part of the workflow.
+
+---
+
+# Data requirements
+
+## Age-clock training
+
+Input: AnnData (`.h5ad`).
+
+Required metadata semantics, with arbitrary user column names:
+
+- cell-type annotation
+- donor/sample identifier
+- chronological age
+
+Optional:
+
+- dataset/cohort identifier
+- disease/control status
+- raw-count layer
+
+The user identifies the corresponding names through CLI options or Python arguments.
+
+## Pretrained prediction
+
+Input: AnnData (`.h5ad`).
+
+Required:
+
+- cell-type column using the exact 11 canonical released labels
+- chronological age column when `stage='auto'`
+
+A raw-count layer can be specified. If no layer is specified, `adata.X` is used as the expression input.
+
+## RAA
+
+Input: CSV/DataFrame with at least:
+
+- donor identifier
+- cell type
+- predicted cellular age
+- chronological age
+- sex
+
+## AASO
+
+Input: cell-level CSV/DataFrame containing:
+
+- donor identifier
+- cell type
+- predicted cellular age
+- RAA
+
+plus a saved threshold JSON/reference bundle.
+
+---
+
+# Model storage and environment variables
+
+Default downloaded pretrained model path:
+
+```text
+~/.scbac/models/scBrainAgeClock_models_file/
+```
+
+Relevant environment variables:
+
+```text
+SCBAC_HOME        Base user cache directory
+SCBAC_MODEL_DIR   Released pretrained-model directory
+SCBAC_MODEL_URL   Override model archive URL
+SCBAC_RAA_DIR     External fixed RAA reference directory
+```
+
+The released Zenodo directory is expected to contain:
+
+```text
+scBrainAgeClock_models_file/
+├── benchmarking_model/
+├── CLM_Adult/
+├── CLM_Development/
+├── CLM_Full/
+├── ElasticNet_Adult/
+├── ElasticNet_Development/
+├── ElasticNet_Full/
+├── Transf_Adult/
+├── Transf_Development/
+├── Transf_Full/
+└── mouseBrainAgeClock/
+```
+
+The pretrained loader intentionally retains compatibility with the original released model filenames inside those directories.
+
+---
+
+# Package structure
+
+```text
+scbac/
+├── pyproject.toml
+├── setup.py
+├── requirements.txt
+├── README.md
+├── LICENSE
+├── src/
+│   └── scbac/
+│       ├── __init__.py
+│       ├── cli.py
+│       ├── constants.py
+│       ├── data.py
+│       ├── install_models.py
+│       ├── pretrained.py
+│       ├── _released_loader.py
+│       ├── training.py
+│       ├── custom.py
+│       ├── raa.py
+│       ├── aaso.py
+│       ├── analysis.py
+│       ├── visualization.py
+│       ├── paths.py
+│       ├── utils.py
+│       ├── models/
+│       │   ├── elasticnet.py
+│       │   ├── clm.py
+│       │   └── transformer.py
+│       └── pretrained_raa/
+├── examples/
+└── tests/
+```
+
+---
+
+# Requirements
+
+The package uses the supplied release requirements:
+
+```text
+torch==2.1.0
+numpy==1.26.4
+pandas==2.2.3
+scanpy==1.10.3
+scipy==1.13.1
+scikit-learn==1.6.1
+anndata==0.10.8
+statsmodels>=0.13.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+requests>=2.25.0
+```
+
+---
+
+# Citation
+
+If you use scBACs or the released pretrained models, please cite the associated scBAC manuscript. The final journal citation/DOI can be inserted here after publication.
+
+For the software repository:
+
+```bibtex
+@software{scBACs2026,
+  author = {Luo, Jianfeng and Liu, Ganqiang and Tang, Yamei},
+  title = {scBACs: Single-cell Brain Age Clocks},
+  year = {2026},
+  publisher = {GitHub},
+  url = {https://github.com/sixguns1984/scBACs}
+}
+```
+
+# Contact
+
+- GitHub Issues: `https://github.com/sixguns1984/scBACs/issues`
+- Jianfeng Luo: `luojf35@mail.sysu.edu.cn`
+- Ganqiang Liu: `liugq3@mail.sysu.edu.cn`
+- Yamei Tang: `tangym@mail.sysu.edu.cn`
+
+# License
+
+MIT License.

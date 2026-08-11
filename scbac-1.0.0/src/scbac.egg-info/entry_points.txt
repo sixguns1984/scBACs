@@ -1,0 +1,3 @@
+[console_scripts]
+scbac = scbac.cli:main
+scbac-install-models = scbac.install_models:main
