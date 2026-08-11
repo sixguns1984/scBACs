@@ -402,7 +402,7 @@ scBACs/
 ├── *.py
 ├── dataset/
 ├── scBrainAgeClock_models_file/
-├── results_/
+├── results/
 └── figures/
 ```
 
