@@ -8,8 +8,9 @@ Purpose:
 3. Retain reproducible gene-cell-type pairs
 4. Reconstruct donor-level lifespan expression trajectories
 5. Cluster standardized trajectories using K-means
-6. Evaluate K = 2-15 and retain K = 5 as the primary solution
-7. Retain K = 8 as a higher-resolution sensitivity analysis
+6. Evaluate K = 2-15 using the silhouette score and Davies-Bouldin index
+7. Identify three data-supported resolutions: maximum silhouette, minimum Davies-Bouldin, and the visually identified silhouette-curve elbow
+8. Retain K = 5 as the primary solution and K = 8 as a higher-resolution sensitivity analysis; K = 2 is retained only as a coarse diagnostic
 
 Main analysis criteria:
 - Training: FDR < 0.05
@@ -56,8 +57,7 @@ from joblib import Parallel, delayed
 from sklearn.cluster import KMeans
 from sklearn.metrics import (
     silhouette_score,
-    davies_bouldin_score,
-    calinski_harabasz_score
+    davies_bouldin_score
 )
 
 from statsmodels.stats.multitest import multipletests
@@ -67,9 +67,7 @@ from statsmodels.stats.multitest import multipletests
 # 2. PATHS AND ANALYSIS SETTINGS
 # ============================================================================
 
-PROJECT_ROOT = os.path.dirname(
-    os.path.abspath(__file__)
-)
+PROJECT_ROOT = Path('./')
 
 DATA_DIR = os.path.join(
     PROJECT_ROOT,
@@ -143,6 +141,10 @@ SPLINE_SMOOTHING_SCALE = 0.5
 
 N_JOBS = 8
 RANDOM_SEED = 444
+
+# Elbow identified by inspection of the silhouette-score curve in the original analysis.
+# Keep this explicit rather than introducing an elbow algorithm that was not used.
+SILHOUETTE_ELBOW_K = 8
 
 DISCOVERY_FDR = 0.05
 VALIDATION_P = 0.05
@@ -1202,7 +1204,7 @@ print(
 
 
 # ============================================================================
-# 13. EVALUATE K = 2 TO K = 15
+# 13. EVALUATE K = 2 TO K = 15 USING THE THREE PRESPECIFIED CRITERIA
 # ============================================================================
 
 print("\n" + "=" * 70)
@@ -1210,7 +1212,6 @@ print("Evaluating the number of trajectory clusters")
 print("=" * 70)
 
 cluster_metrics = []
-
 max_k = min(
     15,
     trajectory_matrix.shape[0] - 1
@@ -1240,25 +1241,59 @@ for k in range(
         trajectory_matrix,
         cluster_id
     )
-    calinski_harabasz = calinski_harabasz_score(
-        trajectory_matrix,
-        cluster_id
-    )
     cluster_metrics.append(
         {
-            "K":
-                k,
-            "Silhouette":
-                silhouette,
-            "Davies_Bouldin":
-                davies_bouldin,
-            "Calinski_Harabasz":
-                calinski_harabasz
+            "K": k,
+            "Silhouette": silhouette,
+            "Davies_Bouldin": davies_bouldin
         }
     )
 
 cluster_metrics = pd.DataFrame(
     cluster_metrics
+)
+
+best_silhouette_row = cluster_metrics.loc[
+    cluster_metrics["Silhouette"].idxmax()
+]
+best_db_row = cluster_metrics.loc[
+    cluster_metrics["Davies_Bouldin"].idxmin()
+]
+silhouette_elbow_k = int(SILHOUETTE_ELBOW_K)
+if silhouette_elbow_k not in cluster_metrics["K"].values:
+    raise ValueError(
+        "SILHOUETTE_ELBOW_K must fall within the evaluated K range."
+    )
+
+best_silhouette_k = int(
+    best_silhouette_row["K"]
+)
+best_db_k = int(
+    best_db_row["K"]
+)
+best_silhouette_score = float(
+    best_silhouette_row["Silhouette"]
+)
+best_db_score = float(
+    best_db_row["Davies_Bouldin"]
+)
+
+print(
+    "\nHighest silhouette score:     K={} (score={:.3f})".format(
+        best_silhouette_k,
+        best_silhouette_score
+    )
+)
+print(
+    "Lowest Davies-Bouldin:       K={} (score={:.3f})".format(
+        best_db_k,
+        best_db_score
+    )
+)
+print(
+    "Silhouette elbow point:      K={}".format(
+        silhouette_elbow_k
+    )
 )
 
 cluster_metrics.to_csv(
@@ -1269,19 +1304,50 @@ cluster_metrics.to_csv(
     index=False
 )
 
+cluster_selection = pd.DataFrame(
+    [
+        {
+            "Criterion": "Highest silhouette score",
+            "Selected_K": best_silhouette_k,
+            "Score": best_silhouette_score
+        },
+        {
+            "Criterion": "Lowest Davies-Bouldin index",
+            "Selected_K": best_db_k,
+            "Score": best_db_score
+        },
+        {
+            "Criterion": "Silhouette elbow point",
+            "Selected_K": silhouette_elbow_k,
+            "Score": np.nan
+        }
+    ]
+)
+
+cluster_selection.to_csv(
+    os.path.join(
+        OUTPUT_DIR,
+        "trajectory_cluster_selection_summary.csv"
+    ),
+    index=False
+)
+
 print(
-    cluster_metrics
+    "\nCluster-selection summary:"
+)
+print(
+    cluster_selection
 )
 
 
 # ============================================================================
-# 14. PLOT CLUSTERING METRICS
+# 14. PLOT THE TWO METRIC CURVES AND THREE SELECTION CRITERIA
 # ============================================================================
 
 fig, axes = plt.subplots(
     1,
-    3,
-    figsize=(11, 3.5)
+    2,
+    figsize=(8, 3.5)
 )
 
 axes[0].plot(
@@ -1289,11 +1355,44 @@ axes[0].plot(
     cluster_metrics["Silhouette"],
     marker="o"
 )
-
+axes[0].scatter(
+    best_silhouette_k,
+    best_silhouette_score,
+    s=60,
+    zorder=5
+)
+axes[0].scatter(
+    silhouette_elbow_k,
+    cluster_metrics.loc[
+        cluster_metrics["K"] == silhouette_elbow_k,
+        "Silhouette"
+    ].iloc[0],
+    s=60,
+    zorder=5
+)
+axes[0].annotate(
+    "maximum: K={}".format(best_silhouette_k),
+    xy=(best_silhouette_k, best_silhouette_score),
+    xytext=(5, 8),
+    textcoords="offset points",
+    fontsize=8
+)
+axes[0].annotate(
+    "elbow: K={}".format(silhouette_elbow_k),
+    xy=(
+        silhouette_elbow_k,
+        cluster_metrics.loc[
+            cluster_metrics["K"] == silhouette_elbow_k,
+            "Silhouette"
+        ].iloc[0]
+    ),
+    xytext=(5, -14),
+    textcoords="offset points",
+    fontsize=8
+)
 axes[0].set_xlabel(
     "K"
 )
-
 axes[0].set_ylabel(
     "Silhouette score"
 )
@@ -1303,27 +1402,24 @@ axes[1].plot(
     cluster_metrics["Davies_Bouldin"],
     marker="o"
 )
-
+axes[1].scatter(
+    best_db_k,
+    best_db_score,
+    s=60,
+    zorder=5
+)
+axes[1].annotate(
+    "minimum: K={}".format(best_db_k),
+    xy=(best_db_k, best_db_score),
+    xytext=(5, 8),
+    textcoords="offset points",
+    fontsize=8
+)
 axes[1].set_xlabel(
     "K"
 )
-
 axes[1].set_ylabel(
     "Davies-Bouldin index"
-)
-
-axes[2].plot(
-    cluster_metrics["K"],
-    cluster_metrics["Calinski_Harabasz"],
-    marker="o"
-)
-
-axes[2].set_xlabel(
-    "K"
-)
-
-axes[2].set_ylabel(
-    "Calinski-Harabasz index"
 )
 
 for ax in axes:
@@ -1332,7 +1428,6 @@ for ax in axes:
     )
 
 plt.tight_layout()
-
 plt.savefig(
     os.path.join(
         FIGURE_DIR,
@@ -1341,12 +1436,53 @@ plt.savefig(
     bbox_inches="tight",
     dpi=600
 )
-
 plt.show()
 
 
 # ============================================================================
-# 15. PRIMARY FIVE-CLUSTER SOLUTION
+# 15. COARSE TWO-CLUSTER DIAGNOSTIC SOLUTION
+# ============================================================================
+
+print("\n" + "=" * 70)
+print("K = 2 coarse diagnostic trajectory clustering")
+print("=" * 70)
+
+kmeans2 = KMeans(
+    n_clusters=2,
+    random_state=RANDOM_SEED,
+    n_init=20
+)
+cluster2 = kmeans2.fit_predict(
+    trajectory_matrix
+)
+trajectory_metadata[
+    "Cluster2_ID"
+] = cluster2
+
+cluster2_name_map = {
+    0: "Coarse trajectory cluster 1",
+    1: "Coarse trajectory cluster 2"
+}
+
+plot_cluster_trajectories(
+    age_grid,
+    trajectory_matrix,
+    cluster2,
+    cluster2_name_map,
+    os.path.join(
+        FIGURE_DIR,
+        "lifespan_trajectory_clusters_K2_diagnostic.pdf"
+    )
+)
+
+print(
+    "K = 2 is retained only as a coarse diagnostic because it does not resolve "
+    "the major temporal patterns required for downstream biological interpretation."
+)
+
+
+# ============================================================================
+# 16. PRIMARY FIVE-CLUSTER SOLUTION
 # ============================================================================
 
 print("\n" + "=" * 70)
@@ -1358,11 +1494,9 @@ kmeans5 = KMeans(
     random_state=RANDOM_SEED,
     n_init=20
 )
-
 cluster5 = kmeans5.fit_predict(
     trajectory_matrix
 )
-
 trajectory_metadata[
     "Cluster5_ID"
 ] = cluster5
@@ -1371,20 +1505,11 @@ trajectory_metadata[
 # Raw K-means cluster numbers are arbitrary, so inspect the median trajectories
 # if the input data or feature set is changed.
 cluster5_name_map = {
-    0:
-        "Progressive age-associated upregulation",
-
-    1:
-        "Biphasic lifespan remodeling",
-
-    2:
-        "Progressive age-associated decline",
-
-    3:
-        "Aging-associated late-life induction",
-
-    4:
-        "Mid-life compensation failure"
+    0: "Progressive age-associated upregulation",
+    1: "Biphasic lifespan remodeling",
+    2: "Progressive age-associated decline",
+    3: "Aging-associated late-life induction",
+    4: "Mid-life compensation failure"
 }
 
 trajectory_metadata[
@@ -1414,7 +1539,7 @@ plot_cluster_trajectories(
 
 
 # ============================================================================
-# 16. EIGHT-CLUSTER HIGHER-RESOLUTION SENSITIVITY ANALYSIS
+# 17. EIGHT-CLUSTER HIGHER-RESOLUTION SENSITIVITY ANALYSIS
 # ============================================================================
 
 print("\n" + "=" * 70)
@@ -1426,39 +1551,22 @@ kmeans8 = KMeans(
     random_state=RANDOM_SEED,
     n_init=20
 )
-
 cluster8 = kmeans8.fit_predict(
     trajectory_matrix
 )
-
 trajectory_metadata[
     "Cluster8_ID"
 ] = cluster8
 
 cluster8_name_map = {
-    0:
-        "Progressive age-associated upregulation",
-
-    1:
-        "Early maturation-linked decline",
-
-    2:
-        "Developmental shutdown",
-
-    3:
-        "Biphasic lifespan remodeling",
-
-    4:
-        "Mid-life compensation failure",
-
-    5:
-        "Homeostatic lifespan maintenance",
-
-    6:
-        "Post-maturational functional decline",
-
-    7:
-        "Aging-associated late-life induction"
+    0: "Progressive age-associated upregulation",
+    1: "Early maturation-linked decline",
+    2: "Developmental shutdown",
+    3: "Biphasic lifespan remodeling",
+    4: "Mid-life compensation failure",
+    5: "Homeostatic lifespan maintenance",
+    6: "Post-maturational functional decline",
+    7: "Aging-associated late-life induction"
 }
 
 trajectory_metadata[
@@ -1488,7 +1596,7 @@ plot_cluster_trajectories(
 
 
 # ============================================================================
-# 17. SAVE FINAL TRAJECTORY CLUSTER ASSIGNMENTS
+# 18. SAVE FINAL TRAJECTORY CLUSTER ASSIGNMENTS
 # ============================================================================
 
 trajectory_metadata.to_csv(
@@ -1502,7 +1610,6 @@ trajectory_metadata.to_csv(
 print(
     "\nSaved trajectory cluster assignments."
 )
-
 print(
     "Output directory:",
     OUTPUT_DIR
@@ -1510,7 +1617,7 @@ print(
 
 
 # ============================================================================
-# 18. OPTIONAL: INSPECT ONE GENE TRAJECTORY
+# 19. OPTIONAL: INSPECT ONE GENE TRAJECTORY
 # ============================================================================
 
 """
@@ -1560,7 +1667,7 @@ if feature_id in trajectory_df.columns:
 
 
 # ============================================================================
-# 19. COMMAND-LINE USAGE
+# 20. COMMAND-LINE USAGE
 # ============================================================================
 
 """
